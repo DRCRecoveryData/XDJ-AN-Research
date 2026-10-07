@@ -1,0 +1,19 @@
+Subject: GPL source request — CDJ-1500X
+
+I am requesting the complete corresponding source code for the following
+GPL-licensed components declared in the license.txt shipped with the
+CDJ-1500X GPL release:
+
+  1. cryptsetup-2.0.6        (license.txt line 5877)
+  2. busybox-1.27.2          (license.txt line 4573)
+  3. uboot 2017.09           (license.txt line 25984)
+  4. uboot-tools-2018.01     (license.txt line 26329)
+
+Additionally, please provide the Linux kernel source tree and U-Boot source
+tree that are compiled into the CDJ-1500X firmware, including all vendor
+patches. These are GPL-2.0 licensed and required for compliance.
+
+Please provide the source in a non-proprietary format (e.g. tar.xz) and
+state the exact upstream version plus the commit hash for each component.
+
+Thank you.
