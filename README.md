@@ -1,15 +1,15 @@
 # AlphaTheta / Pioneer DJ Firmware Security Analysis
 
 **Targets:**
-- CDJ-1500X, firmware `CDJ1500Xv110.UPD` (v1.10, 2/Aug/2026)
-- XDJ-AN, firmware `XDJANv120.UPD` (v1.20, 18/Aug/2026)
+- CDJ-1500X — firmware `CDJ1500Xv110.UPD` (v1.10, 2/Aug/2026)
+- XDJ-AN — firmware `XDJANv120.UPD` (v1.20, 18/Aug/2026)
 
 **Vendor GPL drops analyzed:**
 - `CDJ-1500X.tar.xz` (v1.01, 2/Jul/2026) — partial (external/ only)
 - `XDJ-AN.tar.xz` (Jul 2026) — full BSP (kernel, u-boot, buildroot, rkbin)
 
 **SoC platform:** Rockchip RK3566
-**Storage:** eMMC
+**Storage:** eMMC (not encrypted at rest)
 **OP-TEE version:** 3.7.9
 **Analyst:** drclab
 **Host:** Ubuntu (resolute), AMD Ryzen 5 4600U
@@ -19,28 +19,30 @@
 
 # Table of Contents
 
-1. [Executive Summary](#1-executive-summary)
-2. [Objective](#2-objective)
-3. [Artifacts](#3-artifacts)
-4. [Timeline of Investigation](#4-timeline-of-investigation)
-5. [Phase 1 — Firmware Container Identification](#5-phase-1--firmware-container-identification)
-6. [Phase 2 — The Two LUKS Headers](#6-phase-2--the-two-luks-headers)
-7. [Phase 3 — Header Repair and hashcat](#7-phase-3--header-repair-and-hashcat)
-8. [Phase 4 — Cross-Firmware Comparison](#8-phase-4--cross-firmware-comparison)
-9. [Phase 5 — GPL Source Analysis](#9-phase-5--gpl-source-analysis)
-10. [Phase 6 — OP-TEE Client Library Analysis](#10-phase-6--optee-client-library-analysis)
-11. [Phase 7 — Trusted Application Analysis](#11-phase-7--trusted-application-analysis)
-12. [Phase 8 — Full BSP Analysis (XDJ-AN)](#12-phase-8--full-bsp-analysis-xdj-an)
-13. [Phase 9 — TA Signing and Key Trust](#13-phase-9--ta-signing-and-key-trust)
-14. [Reconstructed Decryption Chain](#14-reconstructed-decryption-chain)
-15. [Conclusion](#15-conclusion)
-16. [Comparison with CDJ-3000](#16-comparison-with-cdj-3000)
-17. [Open Items and Next Steps](#17-open-items-and-next-steps)
-18. [GPL Source Request (Draft)](#18-gpl-source-request-draft)
-19. [Reproducing the Analysis](#19-reproducing-the-analysis)
-20. [Tools Used](#20-tools-used)
-21. [Legal and Ethical Note](#21-legal-and-ethical-note)
-22. [Storage and eMMC Analysis](#22-storage-and-emmc-analysis)
+1. Executive Summary
+2. Objective
+3. Artifacts
+4. Timeline of Investigation
+5. Phase 1 — Firmware Container Identification
+6. Phase 2 — The Two LUKS Headers
+7. Phase 3 — Header Repair and hashcat
+8. Phase 4 — Cross-Firmware Comparison
+9. Phase 5 — GPL Source Analysis
+10. Phase 6 — OP-TEE Client Library Analysis
+11. Phase 7 — Trusted Application Analysis
+12. Phase 8 — Full BSP Analysis (XDJ-AN)
+13. Phase 9 — TA Signing and Key Trust
+14. Phase 10 — Boot Chain and FIT Analysis
+15. Reconstructed Decryption Chain
+16. Conclusion
+17. Comparison with CDJ-3000
+18. Open Items and Next Steps
+19. GPL Source Request (Draft)
+20. Reproducing the Analysis
+21. Tools Used
+22. Storage and eMMC Analysis
+23. Completeness Assessment
+24. Legal and Ethical Note
 
 ---
 
@@ -54,15 +56,17 @@ The key never leaves the OP-TEE secure world.
 The `.UPD` file, the GPL source drops, and the shipped binaries contain no
 material that can produce this key. The LUKS header is a static template
 reused across product lines, not a real encryption header. The TA signing key
-used by production devices was not shipped in the GPL drops.
+used by production devices was not shipped in the GPL drops. The OP-TEE OS
+source tree and the U-Boot FIT signing key were also not shipped.
 
 Both devices use **eMMC** for storage. The eMMC is **not encrypted at rest**;
 only the `.UPD` distribution package is encrypted.
 
 **There is no software-only path to decrypt the firmware on a PC.**
 
-The protection is correctly implemented. Every layer has been analyzed and
-every alternative has been tested.
+The protection is correctly implemented. Every layer accessible through the
+GPL drop and the firmware file has been analyzed and every alternative has
+been tested.
 
 ---
 
@@ -112,7 +116,8 @@ the security architecture of the firmware update mechanism.
 | 10 | `tee-pager.bin` analysis | OP-TEE 3.7.9, HUK key path, production key in eFuse |
 | 11 | Hash search for SDK default pubkey | **Not found** in OP-TEE OS image |
 | 12 | eMMC storage analysis | eMMC, not encrypted at rest |
-| 13 | Conclusion | Hardware-bound; no PC decryption possible |
+| 13 | Boot chain and FIT analysis | `tee.bin` missing from drop |
+| 14 | Conclusion | Hardware-bound; no PC decryption possible |
 
 ---
 
@@ -213,8 +218,6 @@ inner digest changes between products.
 
 ## 7.1 Repairing header #1
 
-Zero slots 6 and 7 and rewrite them as valid inactive slots:
-
 ```bash
 cp --reflink=auto CDJ1500Xv110.UPD /tmp/cdj_patched.img
 dd if=/dev/zero of=/tmp/cdj_patched.img bs=1 seek=496 count=96 conv=notrunc
@@ -276,24 +279,12 @@ The payload region begins at offset `0x1000`:
 $ xxd -l 512 -s 4096 CDJ1500Xv110.UPD
 00001000: 0000 0000 0000 0000 ... (all zeros for 512 bytes)
 000011f0: 0000 0000 0000 0000
-
-$ xxd -l 512 -s 4096 XDJANv120.UPD
-00001000: 0000 0000 0000 0000 ... (all zeros for 512 bytes)
-000011f0: 0000 0000 0000 0000
 ```
 
 **Both payloads have 512 bytes of zeros at `0x1000`, then the encrypted
 payload begins at `0x1200`.**
 
 ## 8.3 Payload entropy
-
-```python
-import math, collections
-d = open("CDJ1500Xv110.UPD", "rb").read()[0x1200:0x1200+65536]
-c = collections.Counter(d)
-e = -sum((v/len(d))*math.log2(v/len(d)) for v in c.values())
-print(e)
-```
 
 | File | Entropy at 0x1200 (64 KB window) | First 32 bytes |
 |---|---|---|
@@ -302,23 +293,16 @@ print(e)
 
 Entropy ≈ 8.0 is maximum for random data. The payload is encrypted with a
 stream cipher or block cipher in a mode that produces ciphertext of full
-entropy. It is not obfuscated, compressed, or patterned.
+entropy.
 
 ## 8.4 Payload diff
 
 ```bash
-$ cmp -l CDJ1500Xv110.UPD XDJANv120.UPD | head
-  625 215 164    ← header #2 differs
-  ...
-  (all subsequent bytes differ)
-
 $ cmp -l CDJ1500Xv110.UPD XDJANv120.UPD | wc -l
 187976897     (of 188,718,095 bytes)
 ```
 
-99.6% of the bytes differ, including all of the encrypted payload. The two
-firmwares share the same container template but contain different encrypted
-content.
+99.6% of the bytes differ, including all of the encrypted payload.
 
 ## 8.5 Container format (final)
 
@@ -335,8 +319,6 @@ content.
 
 ## 9.1 CDJ-1500X drop is incomplete
 
-The CDJ-1500X GPL drop contains only the `external/` slice:
-
 ```
 CDJ-1500X/
   external/
@@ -344,22 +326,20 @@ CDJ-1500X/
     update_engine/  (Rockchip A/B OTA wrapper — network path only)
     mpp/, rockit/, rknpu/, linux-rga/, uvc_app/, bluetooth_bsa/
     ...
-  nxp_driver_fp99/  (NXP Wi-Fi/BT driver)
+  nxp_driver_fp99/
 ```
 
 `license.txt` declares the following GPL/LGPL components:
 
 | Component | license.txt line | Shipped? |
 |---|---|---|
-| busybox-1.27.2 | 4573 | ❌ |
-| cryptsetup-2.0.6 | 5877 | ❌ |
-| uboot 2017.09 | 25984 | ❌ |
-| uboot-tools-2018.01 | 26329 | ❌ |
-| Linux kernel | (implicit) | ❌ |
+| busybox-1.27.2 | 4573 | No |
+| cryptsetup-2.0.6 | 5877 | No |
+| uboot 2017.09 | 25984 | No |
+| uboot-tools-2018.01 | 26329 | No |
+| Linux kernel | (implicit) | No |
 
 ## 9.2 XDJ-AN drop is a full BSP
-
-The XDJ-AN GPL drop is complete:
 
 ```
 XDJ-AN/
@@ -387,8 +367,6 @@ RK_CFG_BUILDROOT=rockchip_rk3566_xdjan
 RK_ROOTFS_TYPE=ext4
 ```
 
-Target SoC: **Rockchip RK3566**.
-
 ## 9.4 Kernel config includes dm-crypt
 
 ```
@@ -405,20 +383,15 @@ CONFIG_CRYPTO_XTS=y
 CONFIG_OPTEE_CLIENT=y
 CONFIG_OPTEE_V2=y
 CONFIG_OPTEE_ALWAYS_USE_SECURITY_PARTITION=y
+CONFIG_SPL_ATF=y
 ```
-
-U-Boot can load Trusted Applications into OP-TEE via `OpteeRpcCmdLoadTa` and
-`OpteeRpcCmdLoadV2Ta` (`u-boot/lib/optee_clientApi/OpteeClientRPC.c`).
 
 ## 9.6 The `.UPD` is not handled by update_engine
 
 `external/recovery/update_engine/` handles Rockchip `RKIMAGE` (`RKAF` magic)
-files. It reads a header, iterates over named partitions (`uboot`, `boot`,
-`rootfs`, etc.), and writes them to `/dev/block/by-name/<name>`. The source
-contains no crypto.
-
-The `.UPD` LUKS container is handled elsewhere, or by a vendor tool not
-shipped in the GPL drop.
+files. It reads a header, iterates over named partitions, and writes them to
+`/dev/block/by-name/<name>`. The source contains no crypto. The `.UPD` LUKS
+container is handled elsewhere.
 
 ---
 
@@ -431,8 +404,6 @@ $ nm -D --defined-only librk_tee_service.so
 0000000000000eb0 T rk_decrypt_data
 0000000000000adc T rk_encrypt_data
 ```
-
-Only two functions. Both are thin wrappers around `TEEC_InvokeCommand`.
 
 ## 10.2 Header documentation
 
@@ -447,18 +418,14 @@ int rk_decrypt_data(unsigned char *cipher, unsigned int cipher_len,
                     unsigned char *plain, unsigned int *plain_len);
 ```
 
-**The key is "auto derived from hardware key in TEE".** This is the
-manufacturer's own documentation of the key path.
+**The key is "auto derived from hardware key in TEE".**
 
 ## 10.3 Command IDs
 
-From aarch64 disassembly of `librk_tee_service.so`:
+From aarch64 disassembly:
 
 ```asm
 ; rk_encrypt_data at 0xadc
-af4:  mov  w0, #0xfd45
-af8:  movk w0, #0x4367, lsl #16
-...  ; UUID 4367fd45-4469-42a6-925d-3857b952704a assembled byte-by-byte
 a88:  mov  w1, #0x0            ; command ID = 0 (encrypt)
 a90:  bl   TEEC_InvokeCommand@plt
 
@@ -467,8 +434,7 @@ e5c:  mov  w1, #0x1            ; command ID = 1 (decrypt)
 e64:  bl   TEEC_InvokeCommand@plt
 ```
 
-No key, IV, salt, nonce, or attribute is passed from normal world. Only
-input/output buffers.
+No key, IV, salt, nonce, or attribute is passed from normal world.
 
 ---
 
@@ -477,17 +443,12 @@ input/output buffers.
 ## 11.1 File format
 
 ```
-$ file 4367fd45-4469-42a6-925d-3857b952704a.ta
-data
-
 $ xxd -l 32 4367fd45-4469-42a6-925d-3857b952704a.ta
 00000000: 48 53 54 4f 01 00 00 00 40 76 01 00 30 48 00 70  HSTO....@v..0H.p
-00000010: 20 00 00 01 7c f5 15 7e 08 ba e9 d8 ec 7e 98 9e   ...|..~.....~..
 ```
 
-- Magic: `HSTO` (Rockchip custom, not standard OP-TEE `*TOP`)
-- Version: 1 (`SHDR_BOOTSTRAP_TA` per `resign_ta.py`)
-- Size: `0x00017640` = 95808 bytes
+- Magic: `HSTO` (Rockchip custom)
+- Version: 1 (`SHDR_BOOTSTRAP_TA`)
 - Signed, **not** encrypted
 
 ## 11.2 Embedded ELF
@@ -495,7 +456,6 @@ $ xxd -l 32 4367fd45-4469-42a6-925d-3857b952704a.ta
 Payload begins at offset 328 (`0x148`):
 
 ```bash
-$ dd if=4367fd45-...ta of=ta_payload.elf bs=1 skip=328
 $ file ta_payload.elf
 ta_payload.elf: ELF 32-bit LSB shared object, ARM, EABI5 version 1 (SYSV),
 dynamically linked, stripped
@@ -504,9 +464,7 @@ dynamically linked, stripped
 ## 11.3 Dynamic symbols
 
 ```
-   3: 000097e0     4 OBJECT  GLOBAL DEFAULT    3 ta_heap_size
    7: 00002d58    24 FUNC    GLOBAL DEFAULT    2 utee_authenc_update_payload
-   9: 00010aac 0x40000 OBJECT  GLOBAL DEFAULT   17 ta_heap
   11: 00002c34    24 FUNC    GLOBAL DEFAULT    2 utee_cipher_update
   13: 00004d09   940 FUNC    GLOBAL DEFAULT    2 AES_encrypt
   15: 00000000    32 OBJECT  GLOBAL DEFAULT    1 ta_head
@@ -534,7 +492,7 @@ lib/libcrypto/fipsmodule/aes/aes.c
 HKDF functions
 ```
 
-`HKDF functions` is the decisive string. The TA derives its AES key via HKDF.
+`HKDF functions` is the decisive string.
 
 ## 11.5 Entry point and crypto calls
 
@@ -547,7 +505,7 @@ From `ta_head` at file offset `0x8000`:
 
 Entry point = `0x28c5` (Thumb mode, real code at `0x28c4`).
 
-Crypto call sites (Thumb disassembly):
+Crypto call sites:
 
 ```asm
 ; TEE_CipherUpdate
@@ -559,17 +517,14 @@ Crypto call sites (Thumb disassembly):
 208c:  blx  2d58 <utee_authenc_update_payload>
 ```
 
-Both paths load the operation handle from `[ctx + 0x3c]`. The handle was
-created by `TEE_CipherInit` / `TEE_AEInit` using a key the TA derived
-internally and never exposes to normal world.
+Both paths load the operation handle from `[ctx + 0x3c]`. The key is derived
+internally and never exposed.
 
 ---
 
 # 12. Phase 8 — Full BSP Analysis (XDJ-AN)
 
 ## 12.1 The second TA
-
-The `securityAuth` buildroot package ships a second TA:
 
 ```
 buildroot/package/rockchip/securityAuth/src/3128h/optee_armtz/
@@ -580,10 +535,9 @@ Header:
 
 ```
 00000000: 4853 544f 0000 0000 84f1 0800 3048 0070  HSTO........0H.p
-00000010: 2000 0001 b008 3d30 8414 7651 f3a5 70cd   .....=0..vQ..p.
 ```
 
-**Version 0** (older format than the CDJ-1500X TA). Strings:
+**Version 0** (older format). Strings:
 
 ```
 rk_create_storage_object
@@ -595,92 +549,42 @@ HKDF functions
 AES-128-CBC, AES-192-CBC, AES-256-CBC
 ```
 
-This TA provides secure storage services, not firmware decryption. The
-firmware decryption TA is `4367fd45-...`.
+This TA provides secure storage services. The firmware decryption TA is
+`4367fd45-...`.
 
 ## 12.2 Device tree
 
 `kernel/arch/arm64/boot/dts/rockchip/rk3566-xdjan-lp4x-v1.dtsi`:
 
 ```dts
+model = "Rockchip RK3566 EP169 LP4X V1 Board";
+compatible = "rockchip,rk3566-evb2-lp4x-v10", "rockchip,rk3566";
+
 compatible = "alphatheta,extcon-atc-usb-gpio";
-...
 // for EP169 USB-C host from CDJ-3000X
-atc_usb_gpio_extcon: atc-usb-gpio-extcon {
-    status = "okay";
-    compatible = "alphatheta,extcon-atc-usb-gpio";
-    ...
-};
 ```
 
-Confirms the device is genuine XDJ-AN hardware, not generic Rockchip EVB.
+Internal codename: **EP169**.
 
-## 12.3 U-Boot TA loading path
+## 12.3 Device tree — peripherals
 
-`u-boot/lib/optee_clientApi/OpteeClientRPC.c`:
+| Feature | Config |
+|---|---|
+| Display | 7" LVDS 1024×600 (Teamworks TC070WS500A0) |
+| Touchscreen | Ilitek ILI2130 on I2C4 |
+| Audio codec | TI TAC5112 on I2C2 |
+| Wi-Fi | Silex SDMAX via SDIO (`sdmmc1`) |
+| Ethernet | GMAC1 RMII |
+| RTC | HYM8563 |
+| CPU PMIC | TCS4525 |
+| eMMC | `sdhci` 8-bit, 200 MHz |
+| SD card | Disabled |
+| USB | USB 3.0 OTG + host, USB 2.0 hosts |
 
-```c
-TEEC_Result OpteeRpcCmdLoadTa(t_teesmc32_arg *TeeSmc32Arg)
-{
-    // ...
-    TEEC_UUID TA_RK_KEYMASTER_UUID = {0x258be795, 0xf9ca, 0x40e6,
-        {0xa8, 0x69, 0x9c, 0xe6, 0x88, 0x6c, 0x5d, 0x5d} };
+No `optee` node, no `crypto` node, no `signature-key` node in the DTS. OP-TEE
+is loaded by SPL from the FIT, not by the kernel.
 
-    if (is_uuid_equal(TeeLoadTaCmd->uuid, TA_RK_KEYMASTER_UUID)) {
-        ImageData = (void *)0;
-        ImageSize = 0;
-    } else {
-        ImageData = (void *)0;
-        ImageSize = 0;
-    }
-    // ...
-}
-```
-
-The stub currently returns zero-size images for all UUIDs. The actual
-production loader that populates `ImageData`/`ImageSize` is elsewhere, likely
-in the SPL or in the OP-TEE OS itself.
-
-## 12.4 U-Boot FIT post-process handler
-
-`u-boot/arch/arm/mach-rockchip/fit_misc.c`:
-
-```c
-void board_fit_image_post_process(void *fit, int node, ulong *load_addr,
-                                  ulong **src_addr, size_t *src_len, void *spec)
-{
-#if CONFIG_IS_ENABLED(MISC_DECOMPRESS) || CONFIG_IS_ENABLED(GZIP)
-    fit_gunzip_image(fit, node, load_addr, src_addr, src_len, spec);
-#endif
-    // ... kernel DTB override only
-}
-```
-
-This function does **not** decrypt. It handles gunzip and DTB override. The
-`.UPD` LUKS payload is not a FIT image.
-
-## 12.5 Secure boot flag
-
-`fit_misc.c` also contains the secure boot check:
-
-```c
-int fit_board_verify_required_sigs(void)
-{
-    uint8_t vboot = 0;
-#ifdef CONFIG_SPL_BUILD
-    dev = misc_otp_get_device(OTP_S);
-    misc_otp_read(dev, OTP_SECURE_BOOT_ENABLE_ADDR, &vboot, 1);
-    vboot = (vboot == 0xff);
-#else
-    trusty_read_vbootkey_enable_flag(&vboot);
-#endif
-    return vboot;
-}
-```
-
-The eFuse bit at `OTP_SECURE_BOOT_ENABLE_ADDR` gates verified boot.
-
-## 12.6 Partition layout
+## 12.4 Partition layout
 
 ```
 CMDLINE: mtdparts=rk29xxnand:
@@ -692,14 +596,29 @@ CMDLINE: mtdparts=rk29xxnand:
   -@0x00226000(reserve:grow)
 ```
 
-The `update` partition is where the `.UPD` payload is written during an
-update.
+**There is no separate `trust` partition.** OP-TEE is packed into the FIT
+image inside the `uboot` partition.
+
+## 12.5 Build system confirms FIT
+
+`device/rockchip/common/mkfirmware.sh`:
+
+```
+rm -f $ROCKDEV/trust.img
+echo "uboot fotmat type is fit, so ignore trust.img..."
+```
+
+`BoardConfig-rk3566-xdjan-lp4x-v1.mk`:
+
+```
+RK_UBOOT_FORMAT_TYPE=fit
+```
 
 ---
 
 # 13. Phase 9 — TA Signing and Key Trust
 
-## 13.1 The signing tools shipped with the GPL drop
+## 13.1 The signing tools
 
 ```
 external/security/rk_tee_user/v2/tools/
@@ -708,16 +627,14 @@ external/security/rk_tee_user/v2/tools/
         change_puk_linux/oem_privkey.pem
         change_puk_linux/tee-pager.bin
         change_puk_window/change_public_key.exe
-        README.md
     ta_resign_tool-release/
         linux/resign_ta.py
         linux/oem_privkey.pem
-        README.txt
 ```
 
 ## 13.2 `resign_ta.py`
 
-The script signs a TA in three formats:
+Signs a TA in three formats:
 
 | Type | Header byte 4 | Protection |
 |---|---|---|
@@ -725,33 +642,19 @@ The script signs a TA in three formats:
 | 1 | `01 00 00 00` | signed (PKCS#1 v1.5 or PSS) |
 | 2 | `02 00 00 00` | signed + AES-GCM encrypted |
 
-The production TA (`4367fd45-...`) is **type 1**: signed, not encrypted. The
-payload is readable. Signing prevents replacement, not analysis.
+The production TA (`4367fd45-...`) is **type 1**: signed, not encrypted.
 
 ## 13.3 Signature verification failed
 
-Extract the signature and ELF payload, then verify with the shipped SDK
-private key:
-
 ```bash
-TA=external/security/bin/optee_v2/ta/4367fd45-4469-42a6-925d-3857b952704a.ta
-dd if="$TA" of=/tmp/ta.sig bs=1 skip=20 count=256
-dd if="$TA" of=/tmp/ta.elf bs=1 skip=328
-openssl pkey -in export-ta_arm64/keys/oem_privkey.pem -pubout -out /tmp/oem_pub.pem
-openssl dgst -sha256 -verify /tmp/oem_pub.pem -signature /tmp/ta.sig /tmp/ta.elf
-```
-
-Result:
-
-```
+$ openssl dgst -sha256 -verify /tmp/oem_pub.pem -signature /tmp/ta.sig /tmp/ta.elf
 Verification failure
 RSA_padding_check_PKCS1_type_1:invalid padding
 ```
 
-The shipped SDK private key did not sign the production TA. AlphaTheta used
-their own production key.
+The shipped SDK private key did not sign the production TA.
 
-## 13.4 The certs in the SDK are OpenSSL tutorial defaults
+## 13.4 Certs are OpenSSL tutorial defaults
 
 ```
 cert/ca.crt:   C=AU, ST=Some-State, O=Internet Widgits Pty Ltd
@@ -759,70 +662,121 @@ cert/mid.crt:  C=AU, ST=Some-State, O=Be Bop - Originalaskkopp
 cert/my.crt:   C=AU, ST=Some-State, O=Testing testers
 ```
 
-These are the default OpenSSL subjects that appear when running `openssl req`
-without overriding the fields. They are development templates, not
-production keys.
+Development templates, not production keys.
 
-## 13.5 The OP-TEE OS image reveals the key trust path
+## 13.5 OP-TEE OS image reveals the key path
 
-`change_puk_linux/tee-pager.bin` (702 KB) is a prebuilt OP-TEE OS image.
-Strings in it:
+`change_puk_linux/tee-pager.bin` strings:
 
 ```
 3aedd  TA signd by old default key will be not support soon! please resign TA!
-3b776  Release version: %d.%d
 3db79  BEEFtee_otp_get_hw_unique_key
 3e06a  syscall_derive_key_from_hard
 3c088  storage_write_vbootkey_hash
 3c152  vbootkey hash has already been writed!
-3c179  vbootkey hash is not equal to writed before!
-3c1a6  vbootkey hash is equal to writed before!
-3c29d  storage_write_attribute_hash
-3c2ba  storage_read_attribute_hash
 ```
 
 Interpretation:
 
 - `tee_otp_get_hw_unique_key` and `syscall_derive_key_from_hard` confirm the
   AES key is derived from the Rockchip Hardware Unique Key in the SoC eFuse.
-- `storage_write_vbootkey_hash` and `vbootkey hash has already been writed!`
-  confirm the TA signing key hash has already been programmed into eFuse and
-  cannot be changed.
-- The "old default key" warning indicates the OP-TEE build still accepts
-  TAs signed with a legacy default key.
+- `vbootkey hash has already been writed!` confirms the TA signing key hash
+  is fused in eFuse and cannot be changed.
 
-## 13.6 The SDK default key is NOT in the OP-TEE OS image
+## 13.6 SDK default key is NOT in the OP-TEE OS image
 
 ```bash
 HASH=$(openssl pkey -in export-ta_arm64/keys/oem_privkey.pem -pubout -outform DER | sha256sum | cut -d' ' -f1)
 # → 3ee5d31b5a58ef76bf1eb71f18de9e2406a85854aa1470d33ec32fa0dcafbfc9
-
-python3 - "$HASH" <<'PY'
-import sys, binascii
-h = sys.argv[1]
-data = open("tee-pager.bin","rb").read()
-raw = binascii.unhexlify(h)
-for name, needle in [("forward", raw), ("reverse", raw[::-1])]:
-    i = data.find(needle)
-    print(f"{name} hash: {hex(i) if i>=0 else 'not found'}")
-PY
 ```
 
-Result:
+Search result:
 
 ```
 forward hash: not found
 reverse hash: not found
 ```
 
-The OP-TEE OS image does **not** contain the SDK default public key hash.
-The "old default key" referenced in the warning string is a **different** key
-that was not shipped. Signing a TA with the SDK template key will not be
-accepted by the device.
+The OP-TEE OS image does not contain the SDK default public key hash.
 
 ---
 
-# 14. Reconstructed Decryption Chain
+# 14. Phase 10 — Boot Chain and FIT Analysis
+
+## 14.1 Boot chain
+
+```
+Power on
+  │
+  ▼
+BootROM (RK3566, in silicon)
+  │  loads from eMMC
+  ▼
+rk356x_spl_v1.14.bin (SPL / BL2)
+  │  loads u-boot.itb (FIT)
+  ▼
+u-boot.itb (FIT image, packed by make_fit_atf.sh)
+  │
+  ├─ atf-1  (BL31)  ARM Trusted Firmware
+  ├─ optee  (BL32)  at TEE_LOAD_ADDR = 0x08400000   ← OP-TEE OS
+  ├─ uboot  (BL33)  U-Boot proper
+  └─ fdt    (U-Boot device tree)
+  │
+  ▼
+ATF starts, OP-TEE loaded into secure world, U-Boot runs in normal world
+  │
+  ▼
+Linux kernel (boot.img FIT)
+```
+
+## 14.2 FIT signing
+
+From `make_fit_atf.sh`:
+
+```
+signature {
+    algo = "sha256,rsa2048";
+    key-name-hint = "dev";
+    sign-images = "fdt", "firmware", "loadables";
+};
+```
+
+The FIT is signed with RSA-2048 + SHA-256. The private key for `dev` is not
+in the GPL drop.
+
+## 14.3 `tee.bin` is missing from the drop
+
+The FIT generator references:
+
+```bash
+openssl dgst -sha256 -binary -out ${srctree}/tee.digest ${srctree}/tee.bin
+data = /incbin/("./tee.bin${SUFFIX}");
+```
+
+`tee.bin` is the complete OP-TEE OS binary. A grep across the entire drop
+finds only `tee-pager.bin` (a component, shipped as a tool input for
+`change_puk`). The actual `tee.bin` used in the FIT is not present.
+
+`tee.bin` is built from the **OP-TEE OS source tree** (`optee_os`), which is
+also not in the drop.
+
+## 14.4 TEE_LOAD_ADDR
+
+From `make_fit_args.sh`:
+
+```bash
+TEE_OFFSET=0x08400000
+TEE_LOAD_ADDR=$((DARM_BASE+TEE_OFFSET))
+```
+
+With `CONFIG_SYS_SDRAM_BASE=0` for RK3566, `TEE_LOAD_ADDR = 0x08400000`
+(132 MB). OP-TEE is loaded at this fixed address in DRAM and stays resident.
+Normal world cannot access this region — protected by the TrustZone
+controller.
+
+---
+
+# 15. Reconstructed Decryption Chain
 
 ```
 CDJ1500Xv110.UPD / XDJANv120.UPD  (on disk)
@@ -859,11 +813,9 @@ Every step is verified by the artifacts listed in section 3.
 
 ---
 
-# 15. Conclusion
+# 16. Conclusion
 
 **There is no software-only path to decrypt the firmware on a PC.**
-
-Supporting evidence:
 
 | Claim | Source |
 |---|---|
@@ -882,6 +834,8 @@ Supporting evidence:
 | Device uses RK3566 SoC | `BoardConfig-rk3566-xdjan-lp4x-v1.mk` |
 | Kernel has `DM_CRYPT=y` and `CRYPTO_XTS=y` | `rockchip_linux_xdjan_defconfig` |
 | U-Boot enables OP-TEE client | `rk3568_xdjan_defconfig` |
+| Boot chain uses FIT with embedded OP-TEE | `make_fit_atf.sh` |
+| `tee.bin` not shipped in GPL drop | grep across whole tree |
 | `tee_otp_get_hw_unique_key` and `syscall_derive_key_from_hard` present | strings in `tee-pager.bin` |
 | OP-TEE version is 3.7.9 | strings in `tee-pager.bin` |
 | Production TA is not signed by SDK default key | `openssl dgst -verify` |
@@ -894,7 +848,7 @@ The protection is correctly implemented.
 
 ---
 
-# 16. Comparison with CDJ-3000
+# 17. Comparison with CDJ-3000
 
 | Feature | CDJ-3000 (older) | CDJ-1500X / XDJ-AN |
 |---|---|---|
@@ -906,37 +860,31 @@ The protection is correctly implemented.
 | GPL source completeness | Kernel + U-Boot typically shipped | CDJ-1500X: partial; XDJ-AN: full BSP |
 | TA signing key | (varies) | Production key, not shipped |
 
-The CDJ-3000's `cdj3k-root` project required a valid firmware encryption key,
-which suggests a model-wide key existed for that generation. The CDJ-1500X
-and XDJ-AN moved to a hardware root of trust with per-device key derivation,
-which removes the single-key weakness.
-
 ---
 
-# 17. Open Items and Next Steps
+# 18. Open Items and Next Steps
 
-## 17.1 GPL source request
+## 18.1 GPL source request
 
-Send the draft in section 18. Specifically request:
+Send the draft in section 19. Specifically request:
 
 - U-Boot 2017.09 source tree (with vendor patches)
 - Linux kernel source tree (with vendor patches)
+- Linux kernel device tree source for the CDJ-1500X
 - cryptsetup-2.0.6 as shipped
 - busybox-1.27.2 as shipped
 - The vendor-specific update tool that reads the `.UPD` container
-- OP-TEE 3.7.9 source tree as shipped
+- OP-TEE OS source tree as shipped (or a statement of the upstream version)
+- The U-Boot FIT signing key, or a statement of its status
 
-## 17.2 OP-TEE 3.7.9 vulnerability tracking
+## 18.2 OP-TEE 3.7.9 vulnerability tracking
 
 Monitor:
 
 - https://github.com/OP-TEE/optee_os/security/advisories
 - https://nvd.nist.gov/
 
-Any bug in OP-TEE 3.7.9 that grants normal-world access to TEE memory, or
-bypasses TA signature verification, would be a potential foothold.
-
-## 17.3 Public key-leak monitoring
+## 18.3 Public key-leak monitoring
 
 Search anchors:
 
@@ -946,7 +894,7 @@ Search anchors:
 - `CDJ-1500X firmware key`
 - `rockchip huk cdj`
 
-## 17.4 Device-side research (requires hardware)
+## 18.4 Device-side research (requires hardware)
 
 If you obtain a CDJ-1500X or XDJ-AN:
 
@@ -956,14 +904,13 @@ If you obtain a CDJ-1500X or XDJ-AN:
    modified signed TA
 4. As a last resort, chip-off the eMMC or read the SoC eFuse
 
-## 17.5 Publication
+## 18.5 Publication
 
-This document is sufficient as a technical report. It can be published on a
-security blog, GitHub, or a research forum.
+This document is sufficient as a technical report.
 
 ---
 
-# 18. GPL Source Request (Draft)
+# 19. GPL Source Request (Draft)
 
 ```
 Subject: GPL source code request — CDJ-1500X and XDJ-AN
@@ -981,10 +928,12 @@ Components declared in license.txt but not shipped (CDJ-1500X release):
   - uboot 2017.09               (license.txt line 25984)
   - uboot-tools-2018.01         (license.txt line 26329)
   - The Linux kernel used in the CDJ-1500X firmware
+  - The Linux kernel device tree source for the CDJ-1500X
 
-Components declared but not shipped (XDJ-AN release):
-  - The vendor-specific update tool that reads the .UPD container
-  - The OP-TEE 3.7.9 source tree as shipped on the device
+Components referenced but not shipped (XDJ-AN release):
+  - tee.bin (OP-TEE OS binary packed into the U-Boot FIT)
+  - The OP-TEE OS source tree used to build tee.bin
+  - The vendor-specific tool that reads the .UPD container
 
 GPL v2 and LGPL require that the complete corresponding source code,
 including any modifications and scripts used to control compilation
@@ -993,11 +942,12 @@ and installation, be provided to anyone who receives the binary.
 Please provide:
   1. The U-Boot source tree used on the CDJ-1500X and XDJ-AN, with vendor patches.
   2. The Linux kernel source tree used on the CDJ-1500X and XDJ-AN, with vendor patches.
-  3. cryptsetup-2.0.6 as shipped.
-  4. busybox-1.27.2 as shipped.
-  5. The OP-TEE 3.7.9 source tree as shipped.
-  6. The vendor-specific tool that reads the .UPD container.
-  7. The exact upstream version and commit hash for each component.
+  3. The Linux kernel device tree source for the CDJ-1500X.
+  4. cryptsetup-2.0.6 as shipped.
+  5. busybox-1.27.2 as shipped.
+  6. The OP-TEE OS source tree as shipped, or the exact upstream version.
+  7. The vendor-specific tool that reads the .UPD container.
+  8. The exact upstream version and commit hash for each component.
 
 Format: tar.xz via download link or similar.
 
@@ -1009,7 +959,7 @@ Thank you.
 
 ---
 
-# 19. Reproducing the Analysis
+# 20. Reproducing the Analysis
 
 ```bash
 # 1. Container identification
@@ -1079,11 +1029,18 @@ for name, needle in [("forward", raw), ("reverse", raw[::-1])]:
     i = data.find(needle)
     print(f"{name}: {hex(i) if i>=0 else 'not found'}")
 PY
+
+# 12. FIT generation scripts
+cat u-boot/arch/arm/mach-rockchip/make_fit_atf.sh
+cat u-boot/arch/arm/mach-rockchip/make_fit_args.sh
+
+# 13. Boot chain verification
+grep FIT_GENERATOR u-boot/configs/rk3568_xdjan_defconfig
 ```
 
 ---
 
-# 20. Tools Used
+# 21. Tools Used
 
 | Tool | Purpose |
 |---|---|
@@ -1099,11 +1056,207 @@ PY
 | `binutils-arm-linux-gnueabihf` | ARM32 / Thumb disassembly |
 | `nm`, `readelf`, `objdump` | Static binary analysis |
 | `openssl` | Key and signature verification |
-| Docker (ubuntu:18.04) | Reproducible build environment for GPL source |
+| `dtc` | Device tree compiler |
+| Docker (ubuntu:18.04) | Reproducible build environment |
 
 ---
 
-# 21. Legal and Ethical Note
+# 22. Storage and eMMC Analysis
+
+## 22.1 Storage type: eMMC
+
+Both the CDJ-1500X and the XDJ-AN use **eMMC** as their primary non-volatile
+storage.
+
+**Partition table:**
+
+```
+CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),
+  0x00080000@0x00006000(boota),
+  0x00080000@0x00086000(bootb),
+  0x00020000@0x00106000(setting),
+  0x00100000@0x00126000(update),
+  -@0x00226000(reserve:grow)
+```
+
+**Kernel drivers:** `dw_mmc.c`, `dw_mmc.h`, `rk_sdmmc.h` in
+`kernel/drivers/mmc/host/`.
+
+**U-Boot config:**
+
+```
+CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_USE_PARTITION=y
+CONFIG_CMD_MMC=y
+CONFIG_ROCKCHIP_NEW_IDB=y
+CONFIG_SPL_MMC_WRITE=y
+```
+
+**Update engine paths:** writes to `/dev/block/by-name/<name>` (eMMC
+namespace).
+
+## 22.2 Is the eMMC encrypted at rest?
+
+**No.** Only the `.UPD` distribution package is encrypted.
+
+Evidence:
+
+1. `CONFIG_DM_CRYPT=y` and `cryptsetup` are present but unused. No init
+   script calls `cryptsetup luksOpen`.
+2. The update engine writes plaintext RKIMAGE (`RKAF`) partitions directly.
+3. The `.UPD` is decrypted before the update engine runs.
+
+## 22.3 What is and is not encrypted
+
+| Partition | Content | Encrypted? |
+|---|---|---|
+| `uboot` | SPL + ATF + OP-TEE + U-Boot (FIT) | No (signed) |
+| `boota` / `bootb` | FIT kernel images | No (signed) |
+| `setting` | Configuration | Usually plaintext |
+| `update` | `.UPD` written by updater | Yes (still encrypted until processed) |
+| `reserve` (rootfs) | ext4 root filesystem | No |
+| RPMB (separate area) | Sealed secrets | Yes (RPMB key, bound to SoC) |
+
+## 22.4 What a dump gives you
+
+**Gives you:**
+- Complete partition table
+- Running U-Boot, kernel FIT, rootfs (plaintext)
+- `setting` partition contents
+- Last `.UPD` on the `update` partition (still encrypted)
+
+**Does not give you:**
+- `.UPD` decryption key (in SoC HUK inside OP-TEE)
+- TA signing private key (production key, never shipped)
+- RPMB key or contents
+- Hardware Unique Key
+
+## 22.5 How to dump the eMMC
+
+### 22.5.1 Maskrom mode (software)
+
+```bash
+sudo apt install -y libusb-1.0-0-dev
+git clone https://github.com/rockchip-linux/rkdeveloptool
+cd rkdeveloptool && autoreconf -i && ./configure && make && sudo make install
+
+sudo rkdeveloptool ld
+sudo rkdeveloptool rfi
+sudo rkdeveloptool rl 0 0x3A00000 emmc_dump.img
+```
+
+### 22.5.2 JTAG / ISP (in-system)
+
+Requires Easy JTAG Plus or compatible programmer with BGA-153 adapter.
+
+### 22.5.3 Chip-off (physical)
+
+Requires hot air rework station, eMMC reader, and replacement chip.
+
+## 22.6 Post-dump entropy check
+
+```bash
+python3 - <<'PY'
+import math, collections
+def entropy(data):
+    c = collections.Counter(data)
+    return -sum((v/len(data))*math.log2(v/len(data)) for v in c.values())
+data = open("emmc_dump.img","rb").read()
+regions = [(0x004000*512, 0x2000*512, "uboot"),
+           (0x006000*512, 0x80000*512, "boota"),
+           (0x086000*512, 0x80000*512, "bootb"),
+           (0x106000*512, 0x20000*512, "setting"),
+           (0x126000*512, 0x100000*512, "update")]
+for off, size, name in regions:
+    chunk = data[off:off+size]
+    if chunk:
+        print(f"{name}: entropy = {entropy(chunk):.4f}")
+PY
+```
+
+Expected: `uboot`, `boota`, `bootb` — 4.5–5.5 (plaintext, signed). `update` —
+7.9+ (encrypted `.UPD`).
+
+## 22.7 A dump does not change the conclusion
+
+| Goal | Does eMMC dump help? |
+|---|---|
+| Understand boot scripts | Yes |
+| Extract rootfs | Yes |
+| Read kernel/U-Boot | Yes |
+| Recover `.UPD` decryption key | No |
+| Recover TA signing key | No |
+| Read RPMB contents | No |
+
+---
+
+# 23. Completeness Assessment
+
+## 23.1 What is complete
+
+| Layer | Status |
+|---|---|
+| Firmware container (`.UPD`) | Fully analyzed |
+| LUKS decoy headers | Fully analyzed |
+| Client library `librk_tee_service.so` | Fully disassembled |
+| TA `4367fd45-...` | Fully disassembled |
+| Second TA `ebc28104-...` | Identified and characterized |
+| TA signing format (`HSTO`, types 0/1/2) | Documented |
+| TA signature verification | Failed against SDK default key |
+| OP-TEE OS version | 3.7.9 |
+| OP-TEE OS key path | `tee_otp_get_hw_unique_key`, `syscall_derive_key_from_hard` |
+| SDK default pubkey in OP-TEE OS | Not found |
+| U-Boot source (XDJ-AN) | Available and analyzed |
+| Kernel source (XDJ-AN) | Available and analyzed |
+| Device tree (XDJ-AN) | Extracted and analyzed |
+| Buildroot config (XDJ-AN) | Available and analyzed |
+| Boot chain (BootROM → SPL → ATF → OP-TEE → U-Boot → Linux) | Fully mapped |
+| FIT generation scripts | Fully documented |
+| eMMC storage | Confirmed |
+| eMMC encryption at rest | Confirmed not encrypted |
+| Cross-product findings (shared header, shared TA UUID) | Verified |
+| Conclusion | Hardware-bound key; no software path |
+
+## 23.2 What is NOT complete
+
+| Missing item | Reason |
+|---|---|
+| CDJ-1500X U-Boot source | Not shipped in GPL drop |
+| CDJ-1500X kernel source | Not shipped in GPL drop |
+| CDJ-1500X device tree source | Not shipped in GPL drop |
+| OP-TEE OS source (`optee_os`) | Not shipped in GPL drop (BSD license, not required) |
+| `tee.bin` (OP-TEE OS binary) | Referenced by build, not shipped |
+| U-Boot FIT signing key (`dev`) | Not shipped, not recoverable |
+| Production TA signing private key | Not shipped, not recoverable |
+| Hardware Unique Key (HUK) | Fused in eFuse, not extractable by software |
+| Live device verification | Requires hardware |
+
+## 23.3 What can still be obtained
+
+- **CDJ-1500X U-Boot/kernel/DT source** — via GPL request
+- **OP-TEE OS source** — via direct request or Rockchip SDK
+- **`tee.bin`** — via request or eMMC dump of a live device
+- **`setting` partition contents** — via eMMC dump
+
+## 23.4 What cannot be obtained by any software means
+
+- **FIT signing key** — not shipped; the signed FIT cannot be reproduced
+- **TA signing key** — production key, not shipped
+- **HUK from eFuse** — physical property of the RK3566 silicon
+- **`.UPD` decryption key** — derived at runtime inside OP-TEE from HUK
+
+## 23.5 Assessment by goal
+
+| Goal | Status |
+|---|---|
+| "Can I decrypt the firmware on a PC?" | No, definitively — full evidence provided |
+| "Can I document the security architecture?" | Yes, complete for XDJ-AN; ~95% for CDJ-1500X |
+| "Can I build a modified firmware the device accepts?" | No — FIT signing key and TA signing key are missing |
+| "Can I extract the HUK?" | No — requires physical access |
+| "Can I do more with the files I have?" | No — all layers analyzed |
+
+---
+
+# 24. Legal and Ethical Note
 
 This analysis was performed on firmware and GPL source obtained from
 AlphaTheta's public download pages, for personal security research.
@@ -1116,359 +1269,3 @@ AlphaTheta's public download pages, for personal security research.
 The firmware analyzed is protected by a hardware root of trust that is
 working as designed. The goal of this research is to document that design,
 not to bypass it.
-
----
-
-# 22. Storage and eMMC Analysis
-
-## 22.1 Storage type: eMMC
-
-Both the CDJ-1500X and the XDJ-AN use **eMMC** as their primary non-volatile
-storage. This is confirmed by multiple independent sources in the XDJ-AN
-GPL BSP:
-
-**Partition table** (`device/rockchip/rk356x/parameter-buildroot-fit-xdjan.txt`):
-
-```
-CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),
-  0x00080000@0x00006000(boota),
-  0x00080000@0x00086000(bootb),
-  0x00020000@0x00106000(setting),
-  0x00100000@0x00126000(update),
-  -@0x00226000(reserve:grow)
-```
-
-`rk29xxnand` is Rockchip's generic mtdparts prefix for the SoC storage
-controller. On RK3566 this maps to the Synopsys DesignWare MMC controller,
-which drives eMMC.
-
-**Kernel drivers** (`XDJ-AN/kernel/drivers/mmc/host/`):
-
-```
-dw_mmc.c
-dw_mmc.h
-rk_sdmmc.h
-```
-
-`dw_mmc` is the Synopsys DesignWare MMC driver used for eMMC on Rockchip
-SoCs.
-
-**U-Boot configuration** (`u-boot/configs/rk3568_xdjan_defconfig`):
-
-```
-CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_USE_PARTITION=y
-CONFIG_CMD_MMC=y
-CONFIG_ROCKCHIP_NEW_IDB=y
-CONFIG_SPL_MMC_WRITE=y
-```
-
-`CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT` selects the MMC (eMMC) device as the
-boot source for the next stage.
-
-**Update engine device paths** (`external/recovery/update_engine/update.cpp`):
-
-```c
-sprintf(update_cmd[i].dest_path, "/dev/block/by-name/%s", update_cmd[i].name);
-```
-
-`/dev/block/` is the eMMC block device namespace. Raw NAND would use
-`/dev/mtd*` with `nandwrite` (which the code also supports as a fallback,
-confirming that eMMC is the primary target).
-
-**Rockchip mini-loader configuration** (`rkbin/RK3566MINIALL.ini`):
-
-```
-[LOADER_OPTION]
-NUM=2
-LOADER1=FlashData
-LOADER2=FlashBoot
-FlashData=bin/rk35_new2/rk3566_ddr_1056MHz_v1.23.bin
-FlashBoot=bin/rk35_new2/rk356x_spl_v1.14.bin
-```
-
-The SPL is written to the eMMC boot area (`FlashBoot`).
-
-## 22.2 Is the eMMC encrypted at rest?
-
-**Evidence strongly indicates the eMMC is NOT encrypted at rest.** Only the
-`.UPD` distribution package is encrypted.
-
-### 22.2.1 No dm-crypt init path
-
-`CONFIG_DM_CRYPT=y` and `CONFIG_CRYPTO_XTS=y` are set in the kernel, and
-`cryptsetup` is built into the rootfs (`BR2_PACKAGE_CRYPTSETUP=y`). However,
-these are **enabled but unused** in the boot flow:
-
-```bash
-grep -rIn -E 'cryptsetup|luksOpen|dm-crypt' buildroot/board/rockchip/ 2>/dev/null
-# no hits in init scripts
-```
-
-No init script calls `cryptsetup luksOpen` before mounting the rootfs. No
-`rd.luks` kernel command line is present. No key management service is
-referenced. If the rootfs were encrypted, all of these would be required.
-
-### 22.2.2 The update path writes plaintext
-
-`external/recovery/update_engine/update.cpp` and `flash_image.cpp` copy
-partition images to eMMC with no crypto step:
-
-```c
-sprintf(update_cmd[i].dest_path, "/dev/block/by-name/%s", update_cmd[i].name);
-update_cmd[i].cmd(_url, (void*)(&update_cmd[i]));
-```
-
-The tool receives a plaintext `RKIMAGE` (`RKAF` magic `0x46414B52`), iterates
-over named partitions, and writes bytes directly. There is no
-`cryptsetup` call, no TEE call, no dm-crypt device creation. The tool cannot
-write encrypted data because it never has an encryption key.
-
-### 22.2.3 The `.UPD` decryption happens before the update engine runs
-
-The actual chain is:
-
-```
-.UPD (LUKS container, encrypted payload)
-   │
-   decrypt via rk_decrypt_data → OP-TEE TA → HUK-derived AES key
-   │
-   plaintext RKIMAGE (RKAF) in memory or temp file
-   │
-   update_engine reads RKIMAGE
-   │
-   writes plaintext partitions to /dev/block/by-name/*
-   │
-   device reboots, mounts plaintext ext4 rootfs
-```
-
-The `.UPD` is a **distribution package** and is encrypted. The data written
-to eMMC after decryption is plaintext.
-
-## 22.3 What is and is not encrypted
-
-| Partition | Content | Encrypted? |
-|---|---|---|
-| `uboot` | U-Boot SPL + proper | No (signed) |
-| `boota` / `bootb` | FIT kernel images | No (signed) |
-| `setting` | Configuration | Usually plaintext; may contain per-device blobs |
-| `update` | `.UPD` written by the updater | Yes (still encrypted until processed) |
-| `reserve` (rootfs) | ext4 root filesystem | No |
-| RPMB (separate eMMC area) | Sealed secrets | Yes (RPMB key, bound to SoC) |
-
-FIT images are **signed**, not encrypted. Signing prevents modification
-(verified boot), but the bytes are readable.
-
-RPMB is a separate physical area on the eMMC, accessed only via an
-authenticated protocol. It is protected by an RPMB key that is bound to the
-SoC. **A raw eMMC dump does not contain RPMB data** — the eMMC controller
-will not expose it without the key.
-
-## 22.4 What a dump would and would not give you
-
-**What a full eMMC dump gives you:**
-
-- The complete partition table (GPT or Rockchip PARM)
-- The running U-Boot, kernel FIT images, and rootfs (all plaintext)
-- The `setting` partition contents
-- The last `.UPD` file written to the `update` partition (still encrypted)
-
-**What it does not give you:**
-
-- The `.UPD` decryption key (derived from the SoC HUK inside OP-TEE)
-- The TA signing private key (AlphaTheta production key, never shipped)
-- The RPMB key or RPMB contents
-- The Hardware Unique Key (fused in the SoC eFuse)
-
-Even a perfect eMMC dump does not enable decryption of future `.UPD` files.
-The key exists only inside the SoC and is never written to storage.
-
-## 22.5 How to dump the eMMC
-
-Three practical methods, ordered by increasing risk.
-
-### 22.5.1 Maskrom mode (software, lowest risk)
-
-Rockchip SoCs support a Maskrom mode that lets the BootROM accept commands
-over USB even when no bootable image is present. This is the intended
-recovery mechanism and the simplest way to read the eMMC.
-
-**Requirements:**
-
-- A host PC running Linux
-- `rkdeveloptool` or the Rockchip `upgrade_tool`
-- A USB connection to the device's download port
-- The device must be able to enter Maskrom mode
-
-**Steps:**
-
-1. Install the tools on the host:
-
-   ```bash
-   sudo apt install -y libusb-1.0-0-dev
-   git clone https://github.com/rockchip-linux/rkdeveloptool
-   cd rkdeveloptool
-   autoreconf -i
-   ./configure
-   make
-   sudo make install
-   ```
-
-2. Enter Maskrom mode on the device. This usually requires shorting a
-   specific test point, holding a button during power-on, or issuing a
-   specific boot command. On many Rockchip devices, holding the Maskrom
-   button while connecting USB is sufficient.
-
-3. Verify detection:
-
-   ```bash
-   sudo rkdeveloptool ld
-   ```
-
-   A detected device shows the Maskrom VID:PID (`2207:350a` for RK3566).
-
-4. Read the eMMC to an image file:
-
-   ```bash
-   # Full eMMC (size in sectors; check with 'rkdeveloptool rfi' first)
-   sudo rkdeveloptool rfi
-   sudo rkdeveloptool rl 0 0x3A00000 emmc_dump.img
-   ```
-
-   `rl` reads sectors. The sector count comes from `rfi` (read flash info).
-   For a 4 GB eMMC, that is roughly `0x800000` sectors of 512 bytes.
-
-5. Verify the dump:
-
-   ```bash
-   file emmc_dump.img
-   ls -lh emmc_dump.img
-   grep -abo 'EFI PART' emmc_dump.img | head
-   ```
-
-**Risks:** Very low. Maskrom is the intended recovery path. No soldering,
-no chip removal.
-
-**Limitation:** RPMB is not readable via Maskrom.
-
-### 22.5.2 JTAG / ISP (in-system, medium risk)
-
-If Maskrom is disabled or inaccessible, JTAG (or the eMMC's native ISP mode)
-can read the storage.
-
-**Requirements:**
-
-- An **Easy JTAG Plus** or compatible programmer
-- An eMMC adapter matching the package (BGA-153 is common)
-- JTAG test points on the PCB, identified via schematic or logic analyzer
-- Software: Easy JTAG Plus suite, or open-source `openocd` with the
-  Rockchip target
-
-**Steps:**
-
-1. Locate the JTAG test points. On Rockchip designs these are usually
-   labeled `TDI`, `TDO`, `TCK`, `TMS`, and `TRST` (or `SRST`). Some boards
-   combine them into a single 6-pin or 10-pin header.
-
-2. Connect the programmer and power the board.
-
-3. Use the programmer's software to identify the SoC and the attached eMMC.
-
-4. Read the eMMC in-circuit.
-
-**Risks:** Medium. Requires soldering to test points and correct JTAG pin
-identification. The board must be powered but not booting.
-
-**Limitation:** Some SoCs disable JTAG in production via eFuse. Verify
-whether JTAG is enabled before investing in this path.
-
-### 22.5.3 Chip-off (highest risk)
-
-Removing the eMMC physically and reading it in a socket.
-
-**Requirements:**
-
-- Hot air rework station
-- Soldering skills and appropriate flux
-- A dedicated eMMC reader (e.g. Easy JTAG Plus with a BGA-153 socket,
-  or a UFi Box)
-- Replacement eMMC if the original is damaged
-
-**Steps:**
-
-1. Photograph the board.
-2. Apply flux and heat the eMMC with hot air to desolder it.
-3. Clean the chip and the board pads.
-4. Place the chip in the reader's socket.
-5. Read the full dump, including the boot partitions and (with the right
-   tool) the RPMB area if the RPMB key is known.
-
-**Risks:** High. The eMMC can crack from thermal stress, the board pads can
-lift, and the device cannot boot afterward unless a replacement chip is
-soldered back with a restored image.
-
-**Benefit:** The only way to read the eMMC boot partitions and any
-controller-level data that Maskrom does not expose.
-
-## 22.6 Post-dump analysis
-
-Once you have a dump, verify whether any partition is encrypted by checking
-entropy:
-
-```bash
-python3 - <<'PY'
-import math, collections, sys
-
-def entropy(data):
-    c = collections.Counter(data)
-    return -sum((v/len(data))*math.log2(v/len(data)) for v in c.values())
-
-data = open(sys.argv[1], "rb").read() if len(sys.argv)>1 else open("emmc_dump.img","rb").read()
-
-# Adjust these offsets to match the GPT from the dump
-regions = [
-    (0x004000 * 512, 0x2000 * 512, "uboot"),
-    (0x006000 * 512, 0x80000 * 512, "boota"),
-    (0x086000 * 512, 0x80000 * 512, "bootb"),
-    (0x106000 * 512, 0x20000 * 512, "setting"),
-    (0x126000 * 512, 0x100000 * 512, "update"),
-]
-
-for off, size, name in regions:
-    chunk = data[off:off+size]
-    if not chunk:
-        print(f"{name}: empty")
-        continue
-    print(f"{name}: entropy = {entropy(chunk):.4f}")
-PY
-```
-
-Expected values if the eMMC is unencrypted:
-
-- `uboot`, `boota`, `bootb` — entropy 4.5–5.5, `file` identifies FIT/DTB
-- `setting` — variable, usually 3–6
-- `update` — entropy 7.9+ (encrypted `.UPD` if present)
-- `reserve` — entropy 4–5.5, ext4 filesystem
-
-If any partition that should contain readable content shows entropy above
-7.5 and `file` cannot identify it, that partition is encrypted. Given the
-BSP analysis, this would be unexpected except for the `update` partition.
-
-## 22.7 eMMC dump does not change the conclusion
-
-A dump is useful for understanding the running system but does not enable
-`.UPD` decryption.
-
-| Goal | Does eMMC dump help? |
-|---|---|
-| Understand the boot scripts | Yes |
-| Extract the rootfs for analysis | Yes |
-| Read the running kernel and U-Boot | Yes |
-| Read the `setting` partition | Yes |
-| Recover the `.UPD` decryption key | No |
-| Recover the TA signing key | No |
-| Read RPMB contents | No |
-| Decrypt a fresh `.UPD` file | No |
-
-The `.UPD` decryption key is derived inside OP-TEE from the SoC HUK, which
-is fused in silicon and never written to storage. The TA signing key hash is
-in eFuse. A full eMMC dump contains neither.
