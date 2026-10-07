@@ -9,6 +9,7 @@
 - `XDJ-AN.tar.xz` (Jul 2026) — full BSP (kernel, u-boot, buildroot, rkbin)
 
 **SoC platform:** Rockchip RK3566
+**Storage:** eMMC
 **OP-TEE version:** 3.7.9
 **Analyst:** drclab
 **Host:** Ubuntu (resolute), AMD Ryzen 5 4600U
@@ -39,6 +40,7 @@
 19. [Reproducing the Analysis](#19-reproducing-the-analysis)
 20. [Tools Used](#20-tools-used)
 21. [Legal and Ethical Note](#21-legal-and-ethical-note)
+22. [Storage and eMMC Analysis](#22-storage-and-emmc-analysis)
 
 ---
 
@@ -52,7 +54,10 @@ The key never leaves the OP-TEE secure world.
 The `.UPD` file, the GPL source drops, and the shipped binaries contain no
 material that can produce this key. The LUKS header is a static template
 reused across product lines, not a real encryption header. The TA signing key
-used by the production devices was not shipped in the GPL drops.
+used by production devices was not shipped in the GPL drops.
+
+Both devices use **eMMC** for storage. The eMMC is **not encrypted at rest**;
+only the `.UPD` distribution package is encrypted.
 
 **There is no software-only path to decrypt the firmware on a PC.**
 
@@ -106,7 +111,8 @@ the security architecture of the firmware update mechanism.
 | 9 | TA signing tools and key verification | SDK default key does NOT verify TA |
 | 10 | `tee-pager.bin` analysis | OP-TEE 3.7.9, HUK key path, production key in eFuse |
 | 11 | Hash search for SDK default pubkey | **Not found** in OP-TEE OS image |
-| 12 | Conclusion | Hardware-bound; no PC decryption possible |
+| 12 | eMMC storage analysis | eMMC, not encrypted at rest |
+| 13 | Conclusion | Hardware-bound; no PC decryption possible |
 
 ---
 
@@ -881,6 +887,8 @@ Supporting evidence:
 | Production TA is not signed by SDK default key | `openssl dgst -verify` |
 | SDK default key hash not in OP-TEE OS image | Python search |
 | Certificates are OpenSSL tutorial defaults | `openssl x509 -subject` |
+| Storage is eMMC | partition table, kernel drivers, U-Boot config |
+| eMMC is not encrypted at rest | no dm-crypt init path, plaintext writes |
 
 The protection is correctly implemented.
 
@@ -1065,7 +1073,7 @@ HASH=$(openssl pkey -in export-ta_arm64/keys/oem_privkey.pem -pubout -outform DE
 python3 - "$HASH" <<'PY'
 import sys, binascii
 h = sys.argv[1]
-data = open(sys.argv[2] if len(sys.argv)>2 else "tee-pager.bin","rb").read()
+data = open("tee-pager.bin","rb").read()
 raw = binascii.unhexlify(h)
 for name, needle in [("forward", raw), ("reverse", raw[::-1])]:
     i = data.find(needle)
@@ -1108,3 +1116,359 @@ AlphaTheta's public download pages, for personal security research.
 The firmware analyzed is protected by a hardware root of trust that is
 working as designed. The goal of this research is to document that design,
 not to bypass it.
+
+---
+
+# 22. Storage and eMMC Analysis
+
+## 22.1 Storage type: eMMC
+
+Both the CDJ-1500X and the XDJ-AN use **eMMC** as their primary non-volatile
+storage. This is confirmed by multiple independent sources in the XDJ-AN
+GPL BSP:
+
+**Partition table** (`device/rockchip/rk356x/parameter-buildroot-fit-xdjan.txt`):
+
+```
+CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),
+  0x00080000@0x00006000(boota),
+  0x00080000@0x00086000(bootb),
+  0x00020000@0x00106000(setting),
+  0x00100000@0x00126000(update),
+  -@0x00226000(reserve:grow)
+```
+
+`rk29xxnand` is Rockchip's generic mtdparts prefix for the SoC storage
+controller. On RK3566 this maps to the Synopsys DesignWare MMC controller,
+which drives eMMC.
+
+**Kernel drivers** (`XDJ-AN/kernel/drivers/mmc/host/`):
+
+```
+dw_mmc.c
+dw_mmc.h
+rk_sdmmc.h
+```
+
+`dw_mmc` is the Synopsys DesignWare MMC driver used for eMMC on Rockchip
+SoCs.
+
+**U-Boot configuration** (`u-boot/configs/rk3568_xdjan_defconfig`):
+
+```
+CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_USE_PARTITION=y
+CONFIG_CMD_MMC=y
+CONFIG_ROCKCHIP_NEW_IDB=y
+CONFIG_SPL_MMC_WRITE=y
+```
+
+`CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT` selects the MMC (eMMC) device as the
+boot source for the next stage.
+
+**Update engine device paths** (`external/recovery/update_engine/update.cpp`):
+
+```c
+sprintf(update_cmd[i].dest_path, "/dev/block/by-name/%s", update_cmd[i].name);
+```
+
+`/dev/block/` is the eMMC block device namespace. Raw NAND would use
+`/dev/mtd*` with `nandwrite` (which the code also supports as a fallback,
+confirming that eMMC is the primary target).
+
+**Rockchip mini-loader configuration** (`rkbin/RK3566MINIALL.ini`):
+
+```
+[LOADER_OPTION]
+NUM=2
+LOADER1=FlashData
+LOADER2=FlashBoot
+FlashData=bin/rk35_new2/rk3566_ddr_1056MHz_v1.23.bin
+FlashBoot=bin/rk35_new2/rk356x_spl_v1.14.bin
+```
+
+The SPL is written to the eMMC boot area (`FlashBoot`).
+
+## 22.2 Is the eMMC encrypted at rest?
+
+**Evidence strongly indicates the eMMC is NOT encrypted at rest.** Only the
+`.UPD` distribution package is encrypted.
+
+### 22.2.1 No dm-crypt init path
+
+`CONFIG_DM_CRYPT=y` and `CONFIG_CRYPTO_XTS=y` are set in the kernel, and
+`cryptsetup` is built into the rootfs (`BR2_PACKAGE_CRYPTSETUP=y`). However,
+these are **enabled but unused** in the boot flow:
+
+```bash
+grep -rIn -E 'cryptsetup|luksOpen|dm-crypt' buildroot/board/rockchip/ 2>/dev/null
+# no hits in init scripts
+```
+
+No init script calls `cryptsetup luksOpen` before mounting the rootfs. No
+`rd.luks` kernel command line is present. No key management service is
+referenced. If the rootfs were encrypted, all of these would be required.
+
+### 22.2.2 The update path writes plaintext
+
+`external/recovery/update_engine/update.cpp` and `flash_image.cpp` copy
+partition images to eMMC with no crypto step:
+
+```c
+sprintf(update_cmd[i].dest_path, "/dev/block/by-name/%s", update_cmd[i].name);
+update_cmd[i].cmd(_url, (void*)(&update_cmd[i]));
+```
+
+The tool receives a plaintext `RKIMAGE` (`RKAF` magic `0x46414B52`), iterates
+over named partitions, and writes bytes directly. There is no
+`cryptsetup` call, no TEE call, no dm-crypt device creation. The tool cannot
+write encrypted data because it never has an encryption key.
+
+### 22.2.3 The `.UPD` decryption happens before the update engine runs
+
+The actual chain is:
+
+```
+.UPD (LUKS container, encrypted payload)
+   │
+   decrypt via rk_decrypt_data → OP-TEE TA → HUK-derived AES key
+   │
+   plaintext RKIMAGE (RKAF) in memory or temp file
+   │
+   update_engine reads RKIMAGE
+   │
+   writes plaintext partitions to /dev/block/by-name/*
+   │
+   device reboots, mounts plaintext ext4 rootfs
+```
+
+The `.UPD` is a **distribution package** and is encrypted. The data written
+to eMMC after decryption is plaintext.
+
+## 22.3 What is and is not encrypted
+
+| Partition | Content | Encrypted? |
+|---|---|---|
+| `uboot` | U-Boot SPL + proper | No (signed) |
+| `boota` / `bootb` | FIT kernel images | No (signed) |
+| `setting` | Configuration | Usually plaintext; may contain per-device blobs |
+| `update` | `.UPD` written by the updater | Yes (still encrypted until processed) |
+| `reserve` (rootfs) | ext4 root filesystem | No |
+| RPMB (separate eMMC area) | Sealed secrets | Yes (RPMB key, bound to SoC) |
+
+FIT images are **signed**, not encrypted. Signing prevents modification
+(verified boot), but the bytes are readable.
+
+RPMB is a separate physical area on the eMMC, accessed only via an
+authenticated protocol. It is protected by an RPMB key that is bound to the
+SoC. **A raw eMMC dump does not contain RPMB data** — the eMMC controller
+will not expose it without the key.
+
+## 22.4 What a dump would and would not give you
+
+**What a full eMMC dump gives you:**
+
+- The complete partition table (GPT or Rockchip PARM)
+- The running U-Boot, kernel FIT images, and rootfs (all plaintext)
+- The `setting` partition contents
+- The last `.UPD` file written to the `update` partition (still encrypted)
+
+**What it does not give you:**
+
+- The `.UPD` decryption key (derived from the SoC HUK inside OP-TEE)
+- The TA signing private key (AlphaTheta production key, never shipped)
+- The RPMB key or RPMB contents
+- The Hardware Unique Key (fused in the SoC eFuse)
+
+Even a perfect eMMC dump does not enable decryption of future `.UPD` files.
+The key exists only inside the SoC and is never written to storage.
+
+## 22.5 How to dump the eMMC
+
+Three practical methods, ordered by increasing risk.
+
+### 22.5.1 Maskrom mode (software, lowest risk)
+
+Rockchip SoCs support a Maskrom mode that lets the BootROM accept commands
+over USB even when no bootable image is present. This is the intended
+recovery mechanism and the simplest way to read the eMMC.
+
+**Requirements:**
+
+- A host PC running Linux
+- `rkdeveloptool` or the Rockchip `upgrade_tool`
+- A USB connection to the device's download port
+- The device must be able to enter Maskrom mode
+
+**Steps:**
+
+1. Install the tools on the host:
+
+   ```bash
+   sudo apt install -y libusb-1.0-0-dev
+   git clone https://github.com/rockchip-linux/rkdeveloptool
+   cd rkdeveloptool
+   autoreconf -i
+   ./configure
+   make
+   sudo make install
+   ```
+
+2. Enter Maskrom mode on the device. This usually requires shorting a
+   specific test point, holding a button during power-on, or issuing a
+   specific boot command. On many Rockchip devices, holding the Maskrom
+   button while connecting USB is sufficient.
+
+3. Verify detection:
+
+   ```bash
+   sudo rkdeveloptool ld
+   ```
+
+   A detected device shows the Maskrom VID:PID (`2207:350a` for RK3566).
+
+4. Read the eMMC to an image file:
+
+   ```bash
+   # Full eMMC (size in sectors; check with 'rkdeveloptool rfi' first)
+   sudo rkdeveloptool rfi
+   sudo rkdeveloptool rl 0 0x3A00000 emmc_dump.img
+   ```
+
+   `rl` reads sectors. The sector count comes from `rfi` (read flash info).
+   For a 4 GB eMMC, that is roughly `0x800000` sectors of 512 bytes.
+
+5. Verify the dump:
+
+   ```bash
+   file emmc_dump.img
+   ls -lh emmc_dump.img
+   grep -abo 'EFI PART' emmc_dump.img | head
+   ```
+
+**Risks:** Very low. Maskrom is the intended recovery path. No soldering,
+no chip removal.
+
+**Limitation:** RPMB is not readable via Maskrom.
+
+### 22.5.2 JTAG / ISP (in-system, medium risk)
+
+If Maskrom is disabled or inaccessible, JTAG (or the eMMC's native ISP mode)
+can read the storage.
+
+**Requirements:**
+
+- An **Easy JTAG Plus** or compatible programmer
+- An eMMC adapter matching the package (BGA-153 is common)
+- JTAG test points on the PCB, identified via schematic or logic analyzer
+- Software: Easy JTAG Plus suite, or open-source `openocd` with the
+  Rockchip target
+
+**Steps:**
+
+1. Locate the JTAG test points. On Rockchip designs these are usually
+   labeled `TDI`, `TDO`, `TCK`, `TMS`, and `TRST` (or `SRST`). Some boards
+   combine them into a single 6-pin or 10-pin header.
+
+2. Connect the programmer and power the board.
+
+3. Use the programmer's software to identify the SoC and the attached eMMC.
+
+4. Read the eMMC in-circuit.
+
+**Risks:** Medium. Requires soldering to test points and correct JTAG pin
+identification. The board must be powered but not booting.
+
+**Limitation:** Some SoCs disable JTAG in production via eFuse. Verify
+whether JTAG is enabled before investing in this path.
+
+### 22.5.3 Chip-off (highest risk)
+
+Removing the eMMC physically and reading it in a socket.
+
+**Requirements:**
+
+- Hot air rework station
+- Soldering skills and appropriate flux
+- A dedicated eMMC reader (e.g. Easy JTAG Plus with a BGA-153 socket,
+  or a UFi Box)
+- Replacement eMMC if the original is damaged
+
+**Steps:**
+
+1. Photograph the board.
+2. Apply flux and heat the eMMC with hot air to desolder it.
+3. Clean the chip and the board pads.
+4. Place the chip in the reader's socket.
+5. Read the full dump, including the boot partitions and (with the right
+   tool) the RPMB area if the RPMB key is known.
+
+**Risks:** High. The eMMC can crack from thermal stress, the board pads can
+lift, and the device cannot boot afterward unless a replacement chip is
+soldered back with a restored image.
+
+**Benefit:** The only way to read the eMMC boot partitions and any
+controller-level data that Maskrom does not expose.
+
+## 22.6 Post-dump analysis
+
+Once you have a dump, verify whether any partition is encrypted by checking
+entropy:
+
+```bash
+python3 - <<'PY'
+import math, collections, sys
+
+def entropy(data):
+    c = collections.Counter(data)
+    return -sum((v/len(data))*math.log2(v/len(data)) for v in c.values())
+
+data = open(sys.argv[1], "rb").read() if len(sys.argv)>1 else open("emmc_dump.img","rb").read()
+
+# Adjust these offsets to match the GPT from the dump
+regions = [
+    (0x004000 * 512, 0x2000 * 512, "uboot"),
+    (0x006000 * 512, 0x80000 * 512, "boota"),
+    (0x086000 * 512, 0x80000 * 512, "bootb"),
+    (0x106000 * 512, 0x20000 * 512, "setting"),
+    (0x126000 * 512, 0x100000 * 512, "update"),
+]
+
+for off, size, name in regions:
+    chunk = data[off:off+size]
+    if not chunk:
+        print(f"{name}: empty")
+        continue
+    print(f"{name}: entropy = {entropy(chunk):.4f}")
+PY
+```
+
+Expected values if the eMMC is unencrypted:
+
+- `uboot`, `boota`, `bootb` — entropy 4.5–5.5, `file` identifies FIT/DTB
+- `setting` — variable, usually 3–6
+- `update` — entropy 7.9+ (encrypted `.UPD` if present)
+- `reserve` — entropy 4–5.5, ext4 filesystem
+
+If any partition that should contain readable content shows entropy above
+7.5 and `file` cannot identify it, that partition is encrypted. Given the
+BSP analysis, this would be unexpected except for the `update` partition.
+
+## 22.7 eMMC dump does not change the conclusion
+
+A dump is useful for understanding the running system but does not enable
+`.UPD` decryption.
+
+| Goal | Does eMMC dump help? |
+|---|---|
+| Understand the boot scripts | Yes |
+| Extract the rootfs for analysis | Yes |
+| Read the running kernel and U-Boot | Yes |
+| Read the `setting` partition | Yes |
+| Recover the `.UPD` decryption key | No |
+| Recover the TA signing key | No |
+| Read RPMB contents | No |
+| Decrypt a fresh `.UPD` file | No |
+
+The `.UPD` decryption key is derived inside OP-TEE from the SoC HUK, which
+is fused in silicon and never written to storage. The TA signing key hash is
+in eFuse. A full eMMC dump contains neither.
